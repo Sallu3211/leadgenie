@@ -2623,28 +2623,54 @@ export async function register() {
               try { await client.logout(); } catch { /* already closed */ }
             }
           } else {
-            // Gmail-oauth branch — added 2026-08-23. This account type was
-            // previously skipped entirely (the `if` above only ever matched
-            // non-Gmail accounts), so Gmail-oauth mailboxes had ZERO
-            // fleet-wide spam-rescue coverage — confirmed live via a real
-            // user-reported spam-placed message that the per-pair
-            // warmup-engage check also couldn't find (separate but related
-            // bug, see the `in:anywhere` fix above `gmailSearch` in the
-            // warmup-engage handler). Gmail has no custom-header search
-            // operator like IMAP, so this keys off the same
-            // "--warmup-ping--" plain-text marker every ping body carries.
-            // Unlike Titan's flaky IMAP BODY SEARCH, Gmail's own search
-            // backend (same one that powers Gmail's UI search box) isn't
-            // known to have that indexing-lag failure mode, so body-text
-            // search is safe to rely on here.
+            // Gmail-oauth branch — added 2026-08-23, REWRITTEN same day after
+            // live verification found the first version silently rescued
+            // nothing. This account type was previously skipped entirely
+            // (the `if` above only ever matched non-Gmail accounts), so
+            // Gmail-oauth mailboxes had ZERO fleet-wide spam-rescue coverage
+            // — confirmed live via a real user-reported spam-placed message
+            // that the per-pair warmup-engage check also couldn't find
+            // (separate but related bug, see the `in:anywhere` fix above
+            // `gmailSearch` in the warmup-engage handler).
+            //
+            // The first version searched `in:spam "--warmup-ping--"
+            // newer_than:5d` — a quoted body-phrase combined with
+            // `newer_than:` scoped to `in:spam`. Live-verified 2026-08-23:
+            // this 3-way combination reproducibly returns ZERO results on
+            // Gmail's search backend even for messages that definitely match
+            // all three conditions (confirmed by fetching the message
+            // directly and finding the literal marker text in its body) —
+            // each pair of terms works alone, only the full combination
+            // fails. Root cause is a Gmail Search API quirk, not a query
+            // bug; dropping any one of the three terms makes it work again.
+            // Real impact: 4-29 warmup pings per account (up to 3 days old)
+            // sitting unrescued in Spam across all 5 gmail-oauth accounts at
+            // time of discovery, with the backstop reporting nothing wrong
+            // the entire time since it silently found 0 every cycle.
+            //
+            // Fix: search on folder+date only (`in:spam newer_than:5d`,
+            // proven reliable alone) to get candidates, then confirm each
+            // one is actually a warmup ping via its real X-Warmup-Ping
+            // header (a metadata fetch, not a search-index lookup) before
+            // rescuing — same header-not-body-search principle as the Titan
+            // IMAP fix above, adapted to Gmail's API shape.
             let token: string | null = null;
-            try { token = await getAccessToken({ id: account.id, type: account.type, email: account.email, smtp_pass: account.smtp_pass }); } catch { /* unreachable this cycle, skip */ }
+            try { token = await getAccessToken({ id: account.id, type: account.type, email: account.email, smtp_pass: account.smtp_pass }); }
+            catch (e: any) { console.error(`[warmup-backstop] Gmail ${account.email}: token fetch failed — ${e.message}`); }
             if (token) {
               try {
-                const messages = await gmailSearch(`in:spam "--warmup-ping--" newer_than:5d`, token);
-                if (messages.length > 0) {
-                  await Promise.all(messages.map(m => gmailModify(m.id, ['INBOX'], ['SPAM'], token!)));
-                  console.log(`[warmup-backstop] rescued ${messages.length} stragglers from spam: ${account.email}`);
+                const candidates = await gmailSearch(`in:spam newer_than:5d`, token);
+                const toRescue: string[] = [];
+                for (const m of candidates) {
+                  const detail = await gmailGet(`/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=X-Warmup-Ping`, token);
+                  if (detail?.payload?.headers?.some((h: any) => h.name === 'X-Warmup-Ping' && h.value === '1')) {
+                    toRescue.push(m.id);
+                  }
+                }
+                console.log(`[warmup-backstop] Gmail sweep ${account.email}: ${candidates.length} in spam, ${toRescue.length} are warmup pings`);
+                if (toRescue.length > 0) {
+                  await Promise.all(toRescue.map(id => gmailModify(id, ['INBOX'], ['SPAM'], token!)));
+                  console.log(`[warmup-backstop] rescued ${toRescue.length} stragglers from spam: ${account.email}`);
                 }
               } catch (e: any) {
                 console.error(`[warmup-backstop] Gmail ${account.email}: ${e.message}`);
