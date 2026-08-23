@@ -1555,7 +1555,14 @@ export async function register() {
           if (token) {
           // Subject+sender search, not body-text search — see the IMAP branch
           // below for why (same root cause, same fix, both providers).
-          const messages = await gmailSearch(`subject:"${subject}" from:${fromAcc.email} newer_than:2d`, token);
+          // in:anywhere is required — Gmail's q= search silently EXCLUDES
+          // Spam/Trash by default (confirmed live 2026-08-23: a real
+          // warmup ping visibly sitting in a recipient's Spam folder was
+          // never found by this search, so landedInSpam never got set and
+          // the message was never rescued/logged — this made every
+          // gmail-oauth account's spam-rate reporting a false "clean"
+          // reading, not real evidence of health).
+          const messages = await gmailSearch(`subject:"${subject}" from:${fromAcc.email} newer_than:2d in:anywhere`, token);
           for (const msg of messages.slice(0, 1)) {
             const detail = await gmailGet(`/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=From,Subject`, token);
             if (!detail) continue;
@@ -2614,6 +2621,34 @@ export async function register() {
             } catch (e: any) {
               console.error(`[warmup-backstop] IMAP ${account.email}: ${e.message}`);
               try { await client.logout(); } catch { /* already closed */ }
+            }
+          } else {
+            // Gmail-oauth branch — added 2026-08-23. This account type was
+            // previously skipped entirely (the `if` above only ever matched
+            // non-Gmail accounts), so Gmail-oauth mailboxes had ZERO
+            // fleet-wide spam-rescue coverage — confirmed live via a real
+            // user-reported spam-placed message that the per-pair
+            // warmup-engage check also couldn't find (separate but related
+            // bug, see the `in:anywhere` fix above `gmailSearch` in the
+            // warmup-engage handler). Gmail has no custom-header search
+            // operator like IMAP, so this keys off the same
+            // "--warmup-ping--" plain-text marker every ping body carries.
+            // Unlike Titan's flaky IMAP BODY SEARCH, Gmail's own search
+            // backend (same one that powers Gmail's UI search box) isn't
+            // known to have that indexing-lag failure mode, so body-text
+            // search is safe to rely on here.
+            let token: string | null = null;
+            try { token = await getAccessToken({ id: account.id, type: account.type, email: account.email, smtp_pass: account.smtp_pass }); } catch { /* unreachable this cycle, skip */ }
+            if (token) {
+              try {
+                const messages = await gmailSearch(`in:spam "--warmup-ping--" newer_than:5d`, token);
+                if (messages.length > 0) {
+                  await Promise.all(messages.map(m => gmailModify(m.id, ['INBOX'], ['SPAM'], token!)));
+                  console.log(`[warmup-backstop] rescued ${messages.length} stragglers from spam: ${account.email}`);
+                }
+              } catch (e: any) {
+                console.error(`[warmup-backstop] Gmail ${account.email}: ${e.message}`);
+              }
             }
           }
         } catch (e: any) {
