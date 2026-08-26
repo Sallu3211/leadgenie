@@ -1276,16 +1276,32 @@ export async function register() {
       } catch { /* non-fatal */ }
     }
 
-    async function gmailSearch(q: string, token: string): Promise<{ id: string }[]> {
+    // `allPages` paginates via nextPageToken (bounded at 10 pages) instead of silently
+    // truncating at the first `maxResults` — found 2026-08-27 live-verified via Railway
+    // logs: the fleet backstop sweep's `in:spam newer_than:5d` query on gmail-oauth
+    // accounts with heavier real spam volume (chrisavans321@, uaeshopify123@) kept
+    // reporting a suspiciously exact "20 in spam" cycle after cycle — the old hardcoded
+    // maxResults=20 with no pagination, so any warmup ping older than the 20 most
+    // recent spam messages in that mailbox was never even fetched, let alone rescued.
+    // Per-pair engage lookups only ever need the newest match, so they keep the old
+    // single-page default.
+    async function gmailSearch(q: string, token: string, opts?: { maxResults?: number; allPages?: boolean }): Promise<{ id: string }[]> {
+      const maxResults = opts?.maxResults ?? 20;
+      const out: { id: string }[] = [];
+      let pageToken: string | undefined;
+      let pages = 0;
       try {
-        const res = await fetch(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=20`,
-          { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10000) },
-        );
-        if (!res.ok) return [];
-        const data = await res.json();
-        return data.messages || [];
-      } catch { return []; }
+        do {
+          const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=${maxResults}${pageToken ? `&pageToken=${pageToken}` : ''}`;
+          const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10000) });
+          if (!res.ok) break;
+          const data = await res.json();
+          out.push(...(data.messages || []));
+          pageToken = opts?.allPages ? data.nextPageToken : undefined;
+          pages++;
+        } while (pageToken && pages < 10);
+      } catch { /* return whatever was collected so far */ }
+      return out;
     }
 
     // Gmail label IDs are per-mailbox and not fixed strings (unlike STARRED/INBOX/SPAM) —
@@ -2659,7 +2675,7 @@ export async function register() {
             catch (e: any) { console.error(`[warmup-backstop] Gmail ${account.email}: token fetch failed — ${e.message}`); }
             if (token) {
               try {
-                const candidates = await gmailSearch(`in:spam newer_than:5d`, token);
+                const candidates = await gmailSearch(`in:spam newer_than:5d`, token, { maxResults: 100, allPages: true });
                 const toRescue: string[] = [];
                 for (const m of candidates) {
                   const detail = await gmailGet(`/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=X-Warmup-Ping`, token);
